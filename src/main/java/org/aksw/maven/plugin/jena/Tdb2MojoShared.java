@@ -128,14 +128,15 @@ public class Tdb2MojoShared extends AbstractMojo {
      * "hint" does NOT match "nt" because "hi" is neither the empty string nor does it end with a dot.
      *
      */
-    // TODO Generate content-type+encoding combinations from registries
+    // XXX Generate content-type+encoding combinations from registries.
     @Parameter(defaultValue = "nt,ttl,nq,trig,owl,nt.gz,ttl.gz,nq.gz,trig.gz,owl.gz,nt.bz2,ttl.bz2,nq.bz2,trig.bz2,owl.bz2")
     private String includeTypes;
 
+    /** Folder in which to create the TDB2 database in and that will be archived. */
     @Parameter(defaultValue = "${project.build.directory}/tdb2")
     private File outputFolder;
 
-    /** Output file (the folder as an archive) */
+    /** Output file. This is the archive of the outputFolder. */
     @Parameter(defaultValue = "${project.build.directory}/tdb2.tar.gz")
     private File outputFile;
 
@@ -152,64 +153,27 @@ public class Tdb2MojoShared extends AbstractMojo {
      * By default, dependencies are scanned for RDF data only if there is no
      * &lt;sources&gt; element.
      */
-    @Parameter(property = "tdb2.alwaysScanDeps", defaultValue = "false")
+    @Parameter(defaultValue = "false")
     private boolean alwaysScanDeps;
 
     /** Output file (the folder as an archive) */
 //    @Parameter(defaultValue = "${project.build.directory}/tdb2.load.ttl")
 //    private File loadStateFile;
 
-    /**
-     * Mapping of a source to a set of graphs.
-     * Sources can be dependencies or files.
-     */
-    public static class SourceToGraphMapping {
-        /** Source file to load. Mutually exclusive with 'dependency'. */
-        protected File file;
-        /** Source Maven artifact to load. Artifact format is g:a:v[:t[:c]]. Mutually exclusive with 'file'. */
-        protected Dependency dependency;
-
-        protected String format;
-
-        /** Attempt lenient parse of the file or artifact. */
-        protected boolean lenient;
-
-        /** The options 'graph' and 'graphs' are mutually exclusive (not interpreted as union).*/
-        protected String graph;
-
-        /** The special constants DEFAULT and ARTIFACT can be used for the default graph and the artifact graph (urn:mvn:g:a:v:t:c). */
-        protected List<String> graphs;
-
-        public File getFile() { return file; }
-        public void setFile(File file) { this.file = file; }
-        public Dependency getDependency() { return dependency; }
-        public void setDependency(Dependency dependency) { this.dependency = dependency; }
-        public String getFormat() { return format; }
-        public void setFormat(String format) { this.format = format; }
-        public boolean isLenient() { return lenient; }
-        public void setLenient(boolean lenient) { this.lenient = lenient;}
-        public String getGraph() { return graph; }
-        public void setGraph(String graph) { this.graph = graph; }
-        public List<String> getGraphs() { return graphs; }
-        public void setGraphs(List<String> graphs) { this.graphs = graphs; }
-        @Override
-        public String toString() {
-            return "SourceToGraphMapping [file=" + file + ", dependency=" + dependency + ", format=" + format
-                    + ", lenient=" + lenient + ", graph=" + graph + ", graphs=" + graphs + "]";
-        }
-    }
-
     /** Mapping of (explicit) sources to graphs. */
     @Parameter
     private List<SourceToGraphMapping> sources = new ArrayList<>();
 
-    /** Whether to create an archive from the database folder */
-    @Parameter(defaultValue = "true")
-    private boolean createArchive;
+    /** Whether to skip creation of the archive from the database folder */
+    @Parameter(property = "tdb2.archive.skip", defaultValue = "false")
+    private boolean skipArchive;
 
-    /** Whether to attach the created archive (only applicable if an archive was created) */
-    @Parameter(defaultValue = "true")
-    private boolean attachArchive;
+    /**
+     * Whether to skip the attachment of the created archive.
+     * If skipped, then the archive will not become an artifact of this project.
+     */
+    @Parameter(property = "tdb2.attach.skip", defaultValue = "false")
+    private boolean skipAttach;
 
     /** Output format */
 //    @Parameter
@@ -437,7 +401,7 @@ public class Tdb2MojoShared extends AbstractMojo {
 //            Files.delete(path);
         }
 
-        if (createArchive) {
+        if (!skipArchive) {
             Path outputFolderPath = outputFolder.toPath().toAbsolutePath();
 
             Path tgtFile = outputFile.toPath().toAbsolutePath();
@@ -456,7 +420,7 @@ public class Tdb2MojoShared extends AbstractMojo {
                 logger.info("Created archive: " + tgtFile);
             }
 
-            if (attachArchive) {
+            if (!skipAttach) {
                 mavenProjectHelper.attachArtifact(project, "tdb2.tar.gz", outputFile);
             }
         }
