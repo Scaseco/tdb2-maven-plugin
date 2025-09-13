@@ -14,27 +14,41 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.NoSuchElementException;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 
 import org.aksw.commons.io.util.FileUtils;
 import org.aksw.commons.io.util.FileUtils.OverwritePolicy;
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.ArchiveEntry;
+import org.apache.commons.compress.archivers.ArchiveException;
+import org.apache.commons.compress.archivers.ArchiveOutputStream;
+import org.apache.commons.compress.archivers.ArchiveStreamFactory;
+import org.apache.commons.compress.archivers.ArchiveStreamProvider;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
-import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
+import org.apache.commons.compress.compressors.CompressorException;
+import org.apache.commons.compress.compressors.CompressorStreamFactory;
+import org.apache.commons.compress.compressors.CompressorStreamProvider;
+import org.apache.jena.atlas.lib.tuple.Tuple;
 import org.apache.jena.dboe.base.file.Location;
+import org.apache.jena.geosparql.configuration.GeoSPARQLOperations;
+import org.apache.jena.geosparql.spatial.SpatialIndex;
 import org.apache.jena.graph.Node;
 import org.apache.jena.graph.NodeFactory;
 import org.apache.jena.query.Dataset;
@@ -43,10 +57,20 @@ import org.apache.jena.rdf.model.ModelFactory;
 import org.apache.jena.riot.RDFDataMgr;
 import org.apache.jena.riot.RDFFormat;
 import org.apache.jena.sparql.core.DatasetGraph;
+import org.apache.jena.sparql.core.Quad;
 import org.apache.jena.sparql.exec.UpdateExec;
 import org.apache.jena.sparql.modify.request.UpdateLoad;
 import org.apache.jena.system.Txn;
 import org.apache.jena.tdb2.TDB2Factory;
+import org.apache.jena.tdb2.solver.SolverLibTDB;
+import org.apache.jena.tdb2.solver.stats.StatsCollectorNodeId;
+import org.apache.jena.tdb2.solver.stats.StatsResults;
+import org.apache.jena.tdb2.store.DatasetGraphTDB;
+import org.apache.jena.tdb2.store.NodeId;
+import org.apache.jena.tdb2.store.nodetable.NodeTable;
+import org.apache.jena.tdb2.store.nodetupletable.NodeTupleTable;
+import org.apache.maven.artifact.Artifact;
+import org.apache.maven.model.Dependency;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.logging.Log;
@@ -58,9 +82,7 @@ import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.MavenProjectHelper;
 import org.eclipse.aether.RepositorySystem;
 import org.eclipse.aether.RepositorySystemSession;
-import org.eclipse.aether.artifact.Artifact;
 import org.eclipse.aether.collection.CollectRequest;
-import org.eclipse.aether.graph.Dependency;
 import org.eclipse.aether.graph.DependencyFilter;
 import org.eclipse.aether.repository.RemoteRepository;
 import org.eclipse.aether.resolution.ArtifactResult;
@@ -117,23 +139,69 @@ public class Tdb2MojoShared extends AbstractMojo {
     @Parameter(defaultValue = "${project.build.directory}/tdb2.tar.gz")
     private File outputFile;
 
+    /** Output archive format. Invoke the 'list-archive-formats' goal to list available options. */
+    @Parameter(defaultValue = "tar")
+    private String outputFormat;
+
+    /** Output archive format. Invoke the 'list-compression-formats' goal to list available options. */
+    @Parameter(defaultValue = "gz")
+    private String outputEncoding;
+
+    /**
+     * Set to true to scan dependencies in addition to specified sources.
+     * By default, dependencies are scanned for RDF data only if there is no
+     * &lt;sources&gt; element.
+     */
+    @Parameter(property = "tdb2.alwaysScanDeps", defaultValue = "false")
+    private boolean alwaysScanDeps;
+
     /** Output file (the folder as an archive) */
 //    @Parameter(defaultValue = "${project.build.directory}/tdb2.load.ttl")
 //    private File loadStateFile;
 
-    public static class FileToGraphMapping {
+    /**
+     * Mapping of a source to a set of graphs.
+     * Sources can be dependencies or files.
+     */
+    public static class SourceToGraphMapping {
+        /** Source file to load. Mutually exclusive with 'dependency'. */
         protected File file;
+        /** Source Maven artifact to load. Artifact format is g:a:v[:t[:c]]. Mutually exclusive with 'file'. */
+        protected Dependency dependency;
+
+        protected String format;
+
+        /** Attempt lenient parse of the file or artifact. */
+        protected boolean lenient;
+
+        /** The options 'graph' and 'graphs' are mutually exclusive (not interpreted as union).*/
         protected String graph;
+
+        /** The special constants DEFAULT and ARTIFACT can be used for the default graph and the artifact graph (urn:mvn:g:a:v:t:c). */
+        protected List<String> graphs;
 
         public File getFile() { return file; }
         public void setFile(File file) { this.file = file; }
+        public Dependency getDependency() { return dependency; }
+        public void setDependency(Dependency dependency) { this.dependency = dependency; }
+        public String getFormat() { return format; }
+        public void setFormat(String format) { this.format = format; }
+        public boolean isLenient() { return lenient; }
+        public void setLenient(boolean lenient) { this.lenient = lenient;}
         public String getGraph() { return graph; }
         public void setGraph(String graph) { this.graph = graph; }
+        public List<String> getGraphs() { return graphs; }
+        public void setGraphs(List<String> graphs) { this.graphs = graphs; }
+        @Override
+        public String toString() {
+            return "SourceToGraphMapping [file=" + file + ", dependency=" + dependency + ", format=" + format
+                    + ", lenient=" + lenient + ", graph=" + graph + ", graphs=" + graphs + "]";
+        }
     }
 
-    /** Mapping of extra files to graphs. */
+    /** Mapping of (explicit) sources to graphs. */
     @Parameter
-    private List<FileToGraphMapping> files = new ArrayList<>();
+    private List<SourceToGraphMapping> sources = new ArrayList<>();
 
     /** Whether to create an archive from the database folder */
     @Parameter(defaultValue = "true")
@@ -157,73 +225,125 @@ public class Tdb2MojoShared extends AbstractMojo {
     public void executeActual() throws Exception {
         Log logger = getLog();
 
-        // Test creation first before resolving dependencies
+        boolean scanDeps = alwaysScanDeps || sources.isEmpty();
+
         Path outputPath = outputFolder.toPath();
         Location location = Location.create(outputPath);
-        {
+
+        // Test creation first before resolving dependencies
+                {
             DatasetGraph dg = TDB2Factory.connectDataset(location).asDatasetGraph();
             dg.close();
         }
 
+        // Add project dependencies to the request.
         DependencyFilter classpathFlter = DependencyFilterUtils.classpathFilter(JavaScopes.COMPILE);
         CollectRequest collectRequest = new CollectRequest();
-        for (org.apache.maven.model.Dependency dep : project.getDependencies()) {
-            collectRequest.addDependency(new Dependency(new org.eclipse.aether.artifact.DefaultArtifact(
-                    dep.getGroupId(), dep.getArtifactId(), dep.getClassifier(),
-                    dep.getType(), dep.getVersion()), JavaScopes.COMPILE));
+
+        if (scanDeps) {
+            for (Dependency dep : project.getDependencies()) {
+                collectRequest.addDependency(AetherUtils.convert(dep));
+            }
         }
 
-        collectRequest.setRepositories(project.getRemoteProjectRepositories());
-        DependencyRequest dependencyRequest = new DependencyRequest(collectRequest, classpathFlter);
+        // Add artifacts referenced by the file-to-graph mapping.
+        // XXX Scope should probably be ignored or set to compile!
+        // Map<Artifact, List<FileToGraphMapping>> sourceArtifacts = new LinkedHashSet<>();
+        Set<String> sourceArtifactIds = new LinkedHashSet<>();
+        for (SourceToGraphMapping mapping : sources) {
+            Dependency dep = mapping.getDependency();
+            if (dep != null) {
+                dep = mapping.getDependency();
+                if (dep != null) {
+                    if (mapping.getFile() != null) {
+                        throw new RuntimeException("dependency and file are mutually exclusive: " + mapping);
+                    }
 
-        Set<String> includeTypeSet = new HashSet<>(Arrays.asList(includeTypes.split(",")));
-
-        DependencyResult dependencyResult = repoSystem.resolveDependencies(repoSession, dependencyRequest);
-
-        List<UpdateLoad> workloads = new ArrayList<>();
-        for (ArtifactResult artifactResult : dependencyResult.getArtifactResults()) {
-            Artifact artifact = artifactResult.getArtifact();
-            String extension = artifact.getExtension();
-
-            boolean accept = false;
-            for (String suffix : includeTypeSet) {
-                if (extension.endsWith(suffix)) {
-                    int l = extension.length();
-                    String tmp = extension.substring(0, l - suffix.length());
-                    accept = tmp.isEmpty() || tmp.endsWith(".");
+                    Artifact ma = PomUtils.toArtifact(dep);
+                    sourceArtifactIds.add(PomUtils.toString(ma));
+                    collectRequest.addDependency(AetherUtils.convert(dep));
                 }
             }
+        }
+        collectRequest.setRepositories(projectRepos);
+        DependencyRequest dependencyRequest = new DependencyRequest(collectRequest, classpathFlter);
+        DependencyResult dependencyResult = repoSystem.resolveDependencies(repoSession, dependencyRequest);
 
-            if (!accept) {
-                logger.debug("Ignoring " + artifact);
-                continue;
+        Map<String, org.eclipse.aether.artifact.Artifact> resolvedArtifacts = new LinkedHashMap<>();
+
+        Set<String> includeTypeSet = new HashSet<>(Arrays.asList(includeTypes.split(",")));
+        List<UpdateLoad> workloads = new ArrayList<>();
+        for (ArtifactResult artifactResult : dependencyResult.getArtifactResults()) {
+
+            org.eclipse.aether.artifact.Artifact artifact = artifactResult.getArtifact();
+            Artifact ma = AetherUtils.convert(artifact);
+            String artifactId = PomUtils.toString(ma);
+            resolvedArtifacts.put(artifactId, artifact);
+
+            boolean isSourceArtifact = sourceArtifactIds.contains(artifactId);
+            if (!isSourceArtifact) {
+                String extension = artifact.getExtension();
+
+                boolean accept = false;
+                for (String suffix : includeTypeSet) {
+                    if (extension.endsWith(suffix)) {
+                        int l = extension.length();
+                        String tmp = extension.substring(0, l - suffix.length());
+                        accept = tmp.isEmpty() || tmp.endsWith(".");
+                    }
+                }
+
+                if (!accept) {
+                    logger.debug("Ignoring " + artifact);
+                    continue;
+                }
+
+                File artifactFile = artifactResult.getArtifact().getFile();
+                String artifactPath = artifactFile.getAbsolutePath();
+
+                String graphName = "urn:mvn:" + PomUtils.toString(AetherUtils.convert(artifact));
+
+                logger.info("Selecting TDB2 workload: " + artifactPath + " -> " + graphName);
+
+                UpdateLoad update = new UpdateLoad(artifactPath, graphName);
+                workloads.add(update);
             }
-
-            File artifactFile = artifactResult.getArtifact().getFile();
-            String artifactPath = artifactFile.getAbsolutePath();
-
-            String graphName = "urn:mvn:" + toString(artifact);
-
-            logger.info("Selecting TDB2 workload: " + artifactPath + " -> " + graphName);
-
-            UpdateLoad update = new UpdateLoad(artifactPath, graphName);
-            workloads.add(update);
         }
 
-        for (FileToGraphMapping mapping : files) {
+        for (SourceToGraphMapping mapping : sources) {
             String graphName = mapping.getGraph();
+            List<String> rawGraphs = mapping.getGraphs();
+
+            if (graphName != null && !rawGraphs.isEmpty()) {
+                throw new IllegalArgumentException("graph and graphs are mutually exclusive. Got: graph = [" + graphName + "], graphs: " + rawGraphs);
+            }
+
+            List<String> graphs = rawGraphs.isEmpty() ? List.of(graphName) : rawGraphs;
+            String art = null;
+            if (mapping.getDependency() != null) {
+                Artifact ma = PomUtils.toArtifact(mapping.getDependency());
+                art = PomUtils.toString(ma);
+            }
             File file = mapping.getFile();
+            if (file == null) {
+                getLog().info("aetherArt: " + art);
+                org.eclipse.aether.artifact.Artifact aetherArtifact = resolvedArtifacts.get(art);
+                file = aetherArtifact.getFile();
+            }
+
             String pathStr = file.getAbsolutePath();
 
-            Node graphNode = graphName == null || graphName.isBlank()
+            for (String graph : graphs) {
+                String finalGraph = graph == null || graph.isBlank()
                     ? null
-                    : NodeFactory.createURI(graphName);
+                    : graph.equals("ARTIFACT") ? "urn:mvn:" + art : graph;
 
-            UpdateLoad update = new UpdateLoad(pathStr, graphNode);
-
-            String graphNodeLabel = getGraphLabel(graphNode);
-            logger.info("Selecting TDB2 workload: " + pathStr + " -> " + graphNodeLabel);
-            workloads.add(update);
+                Node graphNode = finalGraph	== null ? null : NodeFactory.createURI(finalGraph);
+                UpdateLoad update = new UpdateLoad(pathStr, graphNode);
+                String graphNodeLabel = getGraphLabel(graphNode);
+                logger.info("Selecting TDB2 workload: " + pathStr + " -> " + graphNodeLabel);
+                workloads.add(update);
+            }
         }
 
         // XXX This is a simple change detection procedure that needs to evolve in the future.
@@ -244,22 +364,29 @@ public class Tdb2MojoShared extends AbstractMojo {
         Dataset dataset = TDB2Factory.connectDataset(location);
         try {
             DatasetGraph dg = dataset.asDatasetGraph();
+
+            // Run load statements.
             for (UpdateLoad update : workloads) {
                 String source = update.getSource();
                 Node destNode = update.getDest();
 
+                Node nonNullDestNode = destNode == null ? Quad.defaultGraphIRI : destNode;
+
                 String destNodeLabel = getGraphLabel(destNode);
-                boolean isAlreadyLoaded = loadState.getFileStates().containsKey(source);
+                FileState fs = loadState.getFileStates().computeIfAbsent(source, s -> {
+                    FileState r = loadState.getModel().createResource().as(FileState.class);
+                    r.setFileName(s);
+                    return r;
+                });
+
+                Set<Node> loadedGraphs = Optional.ofNullable(fs).map(FileState::getGraphs).orElse(Collections.emptySet());
+                boolean isAlreadyLoaded = loadedGraphs.contains(nonNullDestNode);
 
                 if (isAlreadyLoaded) {
                     logger.info("Skipping TDB2 workload (already loaded): " + source + " -> " + destNodeLabel);
                 } else {
                     logger.info("Executing TDB2 workload: " + source + " -> " + destNodeLabel);
-                    FileState fileState = loadState.getModel().createResource().as(FileState.class);
-                    if (destNode != null) {
-                        fileState.getGraphs().add(destNode);
-                    }
-                    loadState.getFileStates().put (source, fileState);
+                    fs.getGraphs().add(nonNullDestNode);
 
                     Txn.executeWrite(dg, () -> {
                         UpdateExec.dataset(dg).update(update).execute();
@@ -275,6 +402,27 @@ public class Tdb2MojoShared extends AbstractMojo {
                     });
                 }
             }
+
+            if (false) {
+                { // Build tdb2 stats
+                }
+
+                { // Build spatial index
+                    Path spatialIndexPath = outputPath.resolve("spatial.index");
+                    String srsUri = null;
+                    if (srsUri == null) {
+                        String srsURI = GeoSPARQLOperations.findModeSRS(dataset);
+                    }
+                    SpatialIndex.buildSpatialIndex(dataset, srsUri, spatialIndexPath.toFile());
+
+                    // TODO Add to file set
+                }
+
+                // Text index creation would require an assembler block
+                // But running the service would have to be consistent - so perhaps its better
+                // to not support text indexing here.
+            }
+
         } finally {
             dataset.close();
             // StoreConnection.release(location);
@@ -385,13 +533,49 @@ public class Tdb2MojoShared extends AbstractMojo {
         // long   currentFileProgress = -1;
     }
 
-    public static void packageTdb2(Consumer<String> fileCallback, Path fileToWrite, Map<String, Path> fileSet, Path basePath) throws IOException {
+    public <V> Entry<String, V> find(Map<String, V> map, String name) {
+        Entry<String, V> entry = map.entrySet().stream()
+            .filter(e -> e.getKey().equalsIgnoreCase(name))
+            .findFirst()
+            .orElseThrow(() -> new NoSuchElementException("No enntry found for: " + name));
+        return entry;
+    }
+
+    public void packageTdb2(Consumer<String> fileCallback, Path fileToWrite, Map<String, Path> fileSet, Path basePath) throws IOException, ArchiveException {
+
+        Entry<String, ArchiveStreamProvider> archiverEntry = find(ArchiveStreamFactory.findAvailableArchiveOutputStreamProviders(), outputFormat);
+        String archiverName = archiverEntry.getKey();
+        ArchiveStreamProvider archiverProvider = archiverEntry.getValue();
+
+        Function<OutputStream, OutputStream> encoder;
+        if (outputEncoding == null || outputEncoding.isBlank()) {
+            encoder = x -> x;
+        } else {
+            Entry<String, CompressorStreamProvider> encoderEntry = find(CompressorStreamFactory.findAvailableCompressorOutputStreamProviders(), outputEncoding);
+            String encoderName = encoderEntry.getKey();
+            CompressorStreamProvider encodingProvider = encoderEntry.getValue();
+            encoder = x -> {
+                try {
+                    return encodingProvider.createCompressorOutputStream(encoderName, x);
+                } catch (CompressorException e) {
+                    throw new RuntimeException(e);
+                }
+            };
+        }
+
+
+        // String fileExtensionn = ".tar.gz";
+
         try (OutputStream fOut = Files.newOutputStream(fileToWrite);
             BufferedOutputStream buffOut = new BufferedOutputStream(fOut);
-            GzipCompressorOutputStream gzOut = new GzipCompressorOutputStream(buffOut);
-            TarArchiveOutputStream tOut = new TarArchiveOutputStream(gzOut)) {
-            tOut.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
-            tOut.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX);
+            OutputStream encodedOut = encoder.apply(buffOut);
+            ArchiveOutputStream<? extends ArchiveEntry> tOut = archiverProvider.createArchiveOutputStream(archiverName, encodedOut, null)) {
+
+            // Allow archiving large files.
+            if (tOut instanceof TarArchiveOutputStream tarOut) {
+                tarOut.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
+                tarOut.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX);
+            }
 
             Tracker tracker = new Tracker();
             tracker.totalSize = totalSize(fileSet.values().iterator());
@@ -448,8 +632,9 @@ public class Tdb2MojoShared extends AbstractMojo {
                 tracker.currentFileName = displayPath.toString();
                 tracker.currentFileSize = Files.size(file);
 
-                TarArchiveEntry tarEntry = new TarArchiveEntry(file, relPathStr);
-                tOut.putArchiveEntry(tarEntry);
+                // TarArchiveEntry tarEntry = new TarArchiveEntry(file, relPathStr);
+                ArchiveEntry archiveEntry = tOut.createArchiveEntry(file, relPathStr);
+                ((ArchiveOutputStream<ArchiveEntry>)tOut).putArchiveEntry(archiveEntry);
 
                 ScheduledExecutorService ses = Executors.newSingleThreadScheduledExecutor();
                 try (CountingInputStream cin = new CountingInputStream(Files.newInputStream(file))) {
@@ -505,7 +690,8 @@ public class Tdb2MojoShared extends AbstractMojo {
         return b.toString();
     }
 
-    protected String toString(Artifact coord) {
+    @Deprecated
+    protected String toString(org.eclipse.aether.artifact.Artifact coord) {
         String t = coord.getExtension();
         String c = coord.getClassifier();
 
@@ -528,4 +714,41 @@ public class Tdb2MojoShared extends AbstractMojo {
         Path result = pom.resolve(path);
         return result;
     }
+
+    /** Copied from tdbstats.java in (jena-cmds). */
+    private static StatsResults stats$(DatasetGraphTDB dsg, Node gn) {
+
+        NodeTable nt = dsg.getTripleTable().getNodeTupleTable().getNodeTable();
+        StatsCollectorNodeId stats = new StatsCollectorNodeId(nt);
+
+        if ( gn == null ) {
+            Iterator<Tuple<NodeId>> iter = dsg.getTripleTable().getNodeTupleTable().findAll();
+            for ( ; iter.hasNext() ; ) {
+                Tuple<NodeId> t = iter.next();
+                stats.record(null, t.get(0), t.get(1), t.get(2));
+            }
+        } else {
+            // If the union graph, then we need to scan all quads but with
+            // uniqueness.
+            boolean unionGraph = Quad.isUnionGraph(gn);
+            NodeId gnid = null;
+            if ( !unionGraph ) {
+                gnid = nt.getNodeIdForNode(gn);
+                if ( NodeId.isDoesNotExist(gnid) )
+                    System.err.println("No such graph: " + gn);
+                    // Log.warn(tdbstats.class, "No such graph: " + gn);
+            }
+
+            NodeTupleTable ntt = dsg.getQuadTable().getNodeTupleTable();
+            Iterator<Tuple<NodeId>> iter = unionGraph
+                ? SolverLibTDB.unionGraph(ntt)
+                : ntt.find(gnid, null, null, null) ;
+            for ( ; iter.hasNext() ; ) {
+                Tuple<NodeId> t = iter.next();
+                stats.record(t.get(0), t.get(1), t.get(2), t.get(3));
+            }
+        }
+        return stats.results();
+    }
+
 }

@@ -305,6 +305,18 @@
 		</dependency>
 
 		<dependency>
+			<groupId>org.apache.jena</groupId>
+			<artifactId>jena-geosparql</artifactId>
+			<version>${jena.version}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.jena</groupId>
+			<artifactId>jena-text</artifactId>
+			<version>${jena.version}</version>
+		</dependency>
+
+		<dependency>
 			<groupId>org.aksw.jenax</groupId>
 			<artifactId>jenax-reprogen-core</artifactId>
 			<version>${jenax.version}</version>

@@ -13,7 +13,7 @@ public interface FileState
 {
     @Iri(LoadStateTerms.file)
     String getFileName();
-    FileState setFileName();
+    FileState setFileName(String fileName);
 
     // The graph names into which the file was loaded. DEFAULT for default graph.
     @Iri(LoadStateTerms.graph)
